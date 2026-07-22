@@ -34,6 +34,31 @@ def clear_cuda_cache() -> None:
             pass
 
 
+def _cuda_available() -> bool:
+    return bool(torch is not None and torch.cuda.is_available())
+
+
+def _resolve_train_device(device: Any, task_name: str) -> str:
+    requested = str(device).strip() if device is not None else ""
+    if not requested:
+        return "cpu"
+
+    normalized = requested.lower()
+    cuda_requested = (
+        normalized == "cuda"
+        or normalized.startswith("cuda:")
+        or all(part.strip().isdigit() for part in normalized.split(",") if part.strip())
+    )
+    if cuda_requested and not _cuda_available():
+        print(
+            f"[{task_name}] CUDA device '{requested}' requested, but CUDA is not available. "
+            "Using CPU instead.",
+            flush=True,
+        )
+        return "cpu"
+    return requested
+
+
 def _find_auto_resume_checkpoint(project: str, run_name: str) -> Path | None:
     direct = Path(project) / run_name / "weights" / "last.pt"
     candidates: list[Path] = []
@@ -98,13 +123,15 @@ def _checkpoint_finished_for_target_epochs(checkpoint: Path, target_epochs: int)
     return completed_epochs >= int(target_epochs)
 
 
-def _build_attempts(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_attempts(cfg: dict[str, Any], task_name: str) -> list[dict[str, Any]]:
+    device = _resolve_train_device(cfg.get("device", "cpu"), task_name)
+    using_cpu = device.lower() == "cpu"
     base = {
         "imgsz": int(cfg["imgsz"]),
         "batch": int(cfg["batch"]),
-        "workers": int(cfg["workers"]),
-        "amp": bool(cfg.get("amp", True)),
-        "device": str(cfg["device"]),
+        "workers": 0 if using_cpu else int(cfg["workers"]),
+        "amp": False if using_cpu else bool(cfg.get("amp", True)),
+        "device": device,
     }
 
     attempts = [base]
@@ -118,7 +145,7 @@ def _build_attempts(cfg: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "imgsz": min(base["imgsz"], target_imgsz),
                 "batch": max(1, min(base["batch"] // 2, 8)),
-                "workers": min(base["workers"], 4),
+                "workers": 0 if using_cpu else min(base["workers"], 4),
                 "amp": False,
                 "device": base["device"],
             }
@@ -176,7 +203,7 @@ def train_with_auto_fallback(model: Any, data_yaml: str, cfg: dict[str, Any], ta
                 resume_source = "auto"
                 print(f"[{task_name}] Auto-resume enabled. Found checkpoint: {resume_arg}")
 
-    attempts = _build_attempts(cfg)
+    attempts = _build_attempts(cfg, task_name)
     last_error: RuntimeError | None = None
     aug_keys = [
         "hsv_h",
